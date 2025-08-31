@@ -29,21 +29,53 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$VDS_HOST" >> ~/.ssh/known_hosts
 
-      # Готовим сервер: ставим rsync/docker/nginx/certbot, включаем docker, создаём директории
-      - name: Prepare server (install packages & dirs)
+      # Подготовка сервера: ставим только то, чего НЕТ. Это устраняет APT exit code 100.
+      - name: Prepare server (idempotent)
         shell: bash
         run: |
           ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${VDS_USER}@${VDS_HOST} << 'EOF'
             set -e
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y \
-              rsync docker.io docker-compose-plugin nginx certbot python3-certbot-nginx curl
 
-            systemctl enable docker || true
-            systemctl start docker || true
+            export DEBIAN_FRONTEND=noninteractive
+            export NEEDRESTART_MODE=a
 
+            # rsync
+            if ! command -v rsync >/dev/null 2>&1; then
+              apt-get update || true
+              apt-get install -y rsync || true
+            fi
+
+            # docker
+            if ! command -v docker >/dev/null 2>&1; then
+              curl -fsSL https://get.docker.com | sh
+              systemctl enable docker || true
+              systemctl start docker || true
+            else
+              systemctl start docker || true
+            fi
+
+            # docker compose v2 (плагин) — если нет, пробуем поставить, но не валимся, если конфликт
+            if ! docker compose version >/dev/null 2>&1; then
+              apt-get update || true
+              apt-get install -y docker-compose-plugin || true
+            fi
+
+            # nginx
+            if ! command -v nginx >/dev/null 2>&1; then
+              apt-get update || true
+              apt-get install -y nginx || true
+            fi
+
+            # certbot (не обязателен для первого запуска)
+            if ! command -v certbot >/dev/null 2>&1; then
+              apt-get update || true
+              apt-get install -y certbot python3-certbot-nginx || true
+            fi
+
+            # каталоги проекта
             mkdir -p /root/projects/bezperson/app
-            # ES требует поднятый лимит
+
+            # для Elasticsearch
             sysctl -w vm.max_map_count=262144 || true
             if [ ! -f /etc/sysctl.d/99-elasticsearch.conf ]; then
               echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-elasticsearch.conf || true
@@ -51,7 +83,7 @@ jobs:
             fi
           EOF
 
-      # Заливаем репозиторий на сервер по rsync (без .git и node_modules)
+      # Синхронизация проекта на сервер (без .git и node_modules)
       - name: Rsync project to VDS
         shell: bash
         run: |
@@ -61,7 +93,7 @@ jobs:
             --exclude "node_modules" \
             ./ ${VDS_USER}@${VDS_HOST}:/root/projects/bezperson/app
 
-      # Деплой: docker compose build/up, nginx конфиг и SSL, healthchecks
+      # Деплой: docker compose build/up, nginx-конфиг и SSL, healthchecks
       - name: Deploy via SSH
         shell: bash
         run: |
@@ -69,21 +101,18 @@ jobs:
             set -e
             cd /root/projects/bezperson/app
 
-            # Останавливаем, если уже бежит (не падаем, если нет)
             docker compose down || true
-
-            # Сборка и запуск
             docker compose build
             docker compose up -d
 
-            # Применяем nginx-конфиг, если он есть в репо
+            # применяем nginx-конфиг, если он есть в репо
             if [ -f nginx/nginx-cite.conf ]; then
               cp -f nginx/nginx-cite.conf /etc/nginx/sites-available/cite.conf || true
               ln -sf /etc/nginx/sites-available/cite.conf /etc/nginx/sites-enabled/cite.conf || true
               nginx -t && systemctl reload nginx || true
             fi
 
-            # SSL (идемпотентно)
+            # SSL (идемпотентно; не валимся, если домен ещё не указывает на сервер)
             if command -v certbot >/dev/null 2>&1; then
               certbot --nginx -d ${APP_DOMAIN} --register-unsafely-without-email --agree-tos || true
             fi
