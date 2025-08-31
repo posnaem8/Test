@@ -18,7 +18,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Наш ключ хранится в секретах в BASE64 — декодируем в файл
+      # Ключ хранится в секрете в BASE64. Декодируем в файл и добавляем known_hosts.
       - name: Setup SSH key from BASE64 secret
         shell: bash
         env:
@@ -29,7 +29,29 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$VDS_HOST" >> ~/.ssh/known_hosts
 
-      # Синхронизируем файлы репозитория на сервер (не нужен git на сервере)
+      # Готовим сервер: ставим rsync/docker/nginx/certbot, включаем docker, создаём директории
+      - name: Prepare server (install packages & dirs)
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${VDS_USER}@${VDS_HOST} << 'EOF'
+            set -e
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              rsync docker.io docker-compose-plugin nginx certbot python3-certbot-nginx curl
+
+            systemctl enable docker || true
+            systemctl start docker || true
+
+            mkdir -p /root/projects/bezperson/app
+            # ES требует поднятый лимит
+            sysctl -w vm.max_map_count=262144 || true
+            if [ ! -f /etc/sysctl.d/99-elasticsearch.conf ]; then
+              echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-elasticsearch.conf || true
+              sysctl --system || true
+            fi
+          EOF
+
+      # Заливаем репозиторий на сервер по rsync (без .git и node_modules)
       - name: Rsync project to VDS
         shell: bash
         run: |
@@ -39,32 +61,22 @@ jobs:
             --exclude "node_modules" \
             ./ ${VDS_USER}@${VDS_HOST}:/root/projects/bezperson/app
 
-      # Готовим сервер и разворачиваем контейнеры
+      # Деплой: docker compose build/up, nginx конфиг и SSL, healthchecks
       - name: Deploy via SSH
         shell: bash
         run: |
           ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${VDS_USER}@${VDS_HOST} << 'EOF'
             set -e
-
-            # Подстраховка для Elasticsearch (делаем идемпотентно)
-            sysctl -w vm.max_map_count=262144 || true
-            if [ -f /etc/sysctl.d/99-elasticsearch.conf ]; then
-              true
-            else
-              echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-elasticsearch.conf || true
-              sysctl --system || true
-            fi
-
             cd /root/projects/bezperson/app
 
-            # Остановим, если что-то уже запущено
+            # Останавливаем, если уже бежит (не падаем, если нет)
             docker compose down || true
 
-            # Соберем и запустим
+            # Сборка и запуск
             docker compose build
             docker compose up -d
 
-            # Если есть наш nginx-конфиг — применим
+            # Применяем nginx-конфиг, если он есть в репо
             if [ -f nginx/nginx-cite.conf ]; then
               cp -f nginx/nginx-cite.conf /etc/nginx/sites-available/cite.conf || true
               ln -sf /etc/nginx/sites-available/cite.conf /etc/nginx/sites-enabled/cite.conf || true
@@ -76,17 +88,16 @@ jobs:
               certbot --nginx -d ${APP_DOMAIN} --register-unsafely-without-email --agree-tos || true
             fi
 
-            # Healthcheck приложения (покажем логи, если упало)
+            # Локальный healthcheck приложения
             if ! curl -fsS http://127.0.0.1:3000/api/health >/dev/null; then
               echo '--- WEB LOGS ---'
               docker compose logs --no-color web || true
               exit 1
             fi
-
-            echo "OK: app is healthy"
+            echo "OK: local app health is fine"
           EOF
 
-      # Внешняя проверка через домен
+      # Публичная проверка по домену (через Nginx/SSL)
       - name: Public health check via domain
         shell: bash
         run: |
