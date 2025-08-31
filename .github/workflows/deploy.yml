@@ -67,7 +67,7 @@ jobs:
       - name: Rsync project to VDS
         shell: bash
         run: |
-          rsync -az --delete \
+          rsync -az \
             -e "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no" \
             --exclude ".git" \
             --exclude "node_modules" \
