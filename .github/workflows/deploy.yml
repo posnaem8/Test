@@ -18,7 +18,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Ключ хранится в секрете в BASE64. Декодируем в файл и добавляем known_hosts.
       - name: Setup SSH key from BASE64 secret
         shell: bash
         env:
@@ -29,23 +28,19 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$VDS_HOST" >> ~/.ssh/known_hosts
 
-      # Подготовка сервера: ставим только то, чего НЕТ. Это устраняет APT exit code 100.
       - name: Prepare server (idempotent)
         shell: bash
         run: |
           ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${VDS_USER}@${VDS_HOST} << 'EOF'
             set -e
-
             export DEBIAN_FRONTEND=noninteractive
             export NEEDRESTART_MODE=a
 
-            # rsync
-            if ! command -v rsync >/dev/null 2>&1; then
-              apt-get update || true
-              apt-get install -y rsync || true
-            fi
+            # базовые утилиты
+            apt-get update || true
+            apt-get install -y rsync curl || true
 
-            # docker
+            # docker + compose v2
             if ! command -v docker >/dev/null 2>&1; then
               curl -fsSL https://get.docker.com | sh
               systemctl enable docker || true
@@ -53,29 +48,15 @@ jobs:
             else
               systemctl start docker || true
             fi
-
-            # docker compose v2 (плагин) — если нет, пробуем поставить, но не валимся, если конфликт
             if ! docker compose version >/dev/null 2>&1; then
-              apt-get update || true
               apt-get install -y docker-compose-plugin || true
             fi
 
-            # nginx
-            if ! command -v nginx >/dev/null 2>&1; then
-              apt-get update || true
-              apt-get install -y nginx || true
-            fi
+            # nginx + certbot (могут уже стоять)
+            apt-get install -y nginx certbot python3-certbot-nginx || true
 
-            # certbot (не обязателен для первого запуска)
-            if ! command -v certbot >/dev/null 2>&1; then
-              apt-get update || true
-              apt-get install -y certbot python3-certbot-nginx || true
-            fi
-
-            # каталоги проекта
             mkdir -p /root/projects/bezperson/app
-
-            # для Elasticsearch
+            # Для Elasticsearch
             sysctl -w vm.max_map_count=262144 || true
             if [ ! -f /etc/sysctl.d/99-elasticsearch.conf ]; then
               echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-elasticsearch.conf || true
@@ -83,7 +64,6 @@ jobs:
             fi
           EOF
 
-      # Синхронизация проекта на сервер (без .git и node_modules)
       - name: Rsync project to VDS
         shell: bash
         run: |
@@ -93,40 +73,42 @@ jobs:
             --exclude "node_modules" \
             ./ ${VDS_USER}@${VDS_HOST}:/root/projects/bezperson/app
 
-      # Деплой: docker compose build/up, nginx-конфиг и SSL, healthchecks
-      - name: Deploy via SSH
+      - name: Deploy via SSH (use docker/docker-compose.yml)
         shell: bash
         run: |
           ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${VDS_USER}@${VDS_HOST} << 'EOF'
             set -e
             cd /root/projects/bezperson/app
 
-            docker compose down || true
-            docker compose build
-            docker compose up -d
+            # пути к compose-файлам
+            COMPOSE_MAIN="-f docker/docker-compose.yml"
 
-            # применяем nginx-конфиг, если он есть в репо
+            # остановка/сборка/запуск
+            docker compose $COMPOSE_MAIN down || true
+            docker compose $COMPOSE_MAIN build
+            docker compose $COMPOSE_MAIN up -d
+
+            # если есть конфиг nginx в репо — применяем
             if [ -f nginx/nginx-cite.conf ]; then
               cp -f nginx/nginx-cite.conf /etc/nginx/sites-available/cite.conf || true
               ln -sf /etc/nginx/sites-available/cite.conf /etc/nginx/sites-enabled/cite.conf || true
               nginx -t && systemctl reload nginx || true
             fi
 
-            # SSL (идемпотентно; не валимся, если домен ещё не указывает на сервер)
+            # SSL (не падаем, если DNS ещё не указывает на сервер)
             if command -v certbot >/dev/null 2>&1; then
               certbot --nginx -d ${APP_DOMAIN} --register-unsafely-without-email --agree-tos || true
             fi
 
-            # Локальный healthcheck приложения
+            # Локальный healthcheck
             if ! curl -fsS http://127.0.0.1:3000/api/health >/dev/null; then
               echo '--- WEB LOGS ---'
-              docker compose logs --no-color web || true
+              docker compose $COMPOSE_MAIN logs --no-color web || true
               exit 1
             fi
             echo "OK: local app health is fine"
           EOF
 
-      # Публичная проверка по домену (через Nginx/SSL)
       - name: Public health check via domain
         shell: bash
         run: |
